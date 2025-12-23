@@ -3,9 +3,12 @@ import json
 import time
 import asyncio
 import base64
+import uuid
+import random
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Tuple
+from contextlib import contextmanager
 
 import requests
 import websockets
@@ -13,9 +16,30 @@ from dotenv import load_dotenv
 
 from solders.keypair import Keypair as SoldersKeypair
 from solders.transaction import VersionedTransaction as SoldersVTx
+from solders.transaction import Transaction as SoldersLegacyTx
 from solders.pubkey import Pubkey
+from solders.hash import Hash
+from solders.system_program import transfer as sys_transfer, TransferParams
 
 from urllib.parse import urlparse, urlunparse
+
+
+# ==========================
+# timing helpers
+# ==========================
+
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+@contextmanager
+def tlog(name: str, timings: dict):
+    t0 = time.perf_counter()
+    try:
+        yield
+    finally:
+        timings[name] = round((time.perf_counter() - t0) * 1000, 2)
+
 
 # ==========================
 # .env
@@ -59,21 +83,12 @@ if not RPC_URL:
 
 
 def _derive_ws_url_from_http(rpc_url: str) -> str:
-    """
-    Преобразуем
-      https://... → wss://...
-      http://...  → ws://...
-
-    Для Helius и похожих провайдеров обычно достаточно сменить схему.
-    """
     p = urlparse(rpc_url)
     if p.scheme in ("http", "https"):
         ws_scheme = "wss" if p.scheme == "https" else "ws"
     else:
         ws_scheme = "wss"
-    return urlunparse(
-        (ws_scheme, p.netloc, p.path, p.params, p.query, p.fragment)
-    )
+    return urlunparse((ws_scheme, p.netloc, p.path, p.params, p.query, p.fragment))
 
 
 RPC_WS_URL = _derive_ws_url_from_http(RPC_URL)
@@ -90,7 +105,6 @@ WATCH_WALLET_RAW = (os.getenv("WATCH_WALLET") or "").strip()
 WATCH_WALLETS: List[str] = []
 if WATCH_WALLET_RAW:
     parts = [p.strip() for p in WATCH_WALLET_RAW.split(",") if p.strip()]
-    # На всякий случай убираем возможные префиксы вида WATCH_WALLET=...
     for p in parts:
         if p.startswith("WATCH_WALLET="):
             p = p.split("=", 1)[1].strip()
@@ -103,23 +117,23 @@ if not WATCH_WALLETS:
 MIN_WALLET_BUY_SOL = as_float(os.getenv("MIN_WALLET_BUY_SOL"), 0.01)
 TRIGGER_SELL_SOL = as_float(os.getenv("TRIGGER_SELL_SOL"), 0.1)
 
+# IMPORTANT: BUY_SOL тут используем как "BUY_WSOL" (сколько WSOL тратим на покупку)
 BUY_SOL = as_float(os.getenv("BUY_SOL"), 0.01)
+BUY_WSOL = BUY_SOL
+
 SLIPPAGE_BPS = as_int(os.getenv("SLIPPAGE_BPS"), 900)
 
-# приоритетная комиссия для покупок
 PRIORITY_FEE_LAMPORTS = as_int(os.getenv("PRIORITY_FEE_LAMPORTS"), 0)
+SELL_PRIORITY_FEE_LAMPORTS = as_int(os.getenv("SELL_PRIORITY_FEE_LAMPORTS"), PRIORITY_FEE_LAMPORTS)
 
-# отдельная приора для продаж (autosell); если не задана — равна BUY
-SELL_PRIORITY_FEE_LAMPORTS = as_int(
-    os.getenv("SELL_PRIORITY_FEE_LAMPORTS"), PRIORITY_FEE_LAMPORTS,
-)
-
-# Автопродажа по умолчанию ВЫКЛЮЧЕНА (можно включить через .env)
+# TP/SL включаются через AUTO_SELL=true в .env
 AUTO_SELL = as_bool(os.getenv("AUTO_SELL"), False)
-TP_PCT = as_float(os.getenv("AUTO_TP_PCT"), 5.0)   # 5%
-SL_PCT = as_float(os.getenv("AUTO_SL_PCT"), 25.0)  # 25%
-
+TP_PCT = as_float(os.getenv("AUTO_TP_PCT"), 5.0)
+SL_PCT = as_float(os.getenv("AUTO_SL_PCT"), 25.0)
 POLL_SECONDS = as_float(os.getenv("AUTO_SELL_POLL_INTERVAL"), 1.0)
+
+# ✅ чтобы не спамить ценой каждую итерацию autosell
+AUTOSELL_LOG_EVERY_SEC = as_float(os.getenv("AUTOSELL_LOG_EVERY_SEC"), 10.0)
 
 REQUIRE_PUMPFUN = as_bool(os.getenv("REQUIRE_PUMPFUN"), True)
 POOL_AMM_ID = (os.getenv("POOL_AMM_ID") or "").strip() or None
@@ -140,51 +154,81 @@ if JUP_BASE_ENV:
 SKIP_PREFLIGHT = as_bool(os.getenv("SKIP_PREFLIGHT"), False)
 FAST_CONFIRM = as_bool(os.getenv("FAST_CONFIRM"), True)
 
-# Диапазон падения ЦЕНЫ (в %), вызванный одной продажей, при котором входим
 ONE_SELL_DROP_MIN_PCT = as_float(os.getenv("ONE_SELL_DROP_MIN_PCT"), 2.0)
 ONE_SELL_DROP_MAX_PCT = as_float(os.getenv("ONE_SELL_DROP_MAX_PCT"), 70.0)
 
-# Минимальная ликвидность, при которой бот вообще рассматривает вход
 MIN_LIQ_USD = as_float(os.getenv("MIN_LIQ_USD"), 40_000.0)
-
-# Минимальная доля SOL-части пула (в %) для одной продажи,
-# чтобы считать её "достаточно большой".
 MIN_SELL_SHARE_PCT = as_float(os.getenv("MIN_SELL_SHARE_PCT"), 1.0)
-
-# Грубая оценка цены SOL в USD для расчёта доли SOL-части пула.
 SOL_PRICE_USD = as_float(os.getenv("SOL_PRICE_USD"), 150.0)
+
+# LIQ cache behavior
+LIQ_TTL_SEC = as_float(os.getenv("LIQ_TTL_SEC"), 25.0)  # кэш валиден N секунд
+LIQ_REFRESH_SEC = as_float(os.getenv("LIQ_REFRESH_SEC"), 12.0)  # фоновый refresh раз в N секунд
+LIQ_REFRESH_CONCURRENCY = as_int(os.getenv("LIQ_REFRESH_CONCURRENCY"), 4)
 
 WSOL_MINT = "So11111111111111111111111111111111111111112"
 
-# SPL Token-2022 (из логов Jupiter/Pump)
-TOKEN_PROGRAM_ID = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+# IMPORTANT:
+# - Pump.fun токены часто Token-2022
+# - WSOL (So111...) — legacy SPL Token
+TOKEN_PROGRAM_2022 = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+TOKEN_PROGRAM_LEGACY = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
 ASSOCIATED_TOKEN_PROGRAM_ID = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+
+# ==========================
+# Jito sender + UUID + TIP
+# ==========================
+
+USE_JITO_SEND = as_bool(os.getenv("USE_JITO_SEND"), True)
+JITO_FALLBACK_RPC = as_bool(os.getenv("JITO_FALLBACK_RPC"), True)
+
+JITO_UUID = (os.getenv("JITO_UUID") or "").strip()
+if not JITO_UUID:
+    JITO_UUID = str(uuid.uuid4())
+
+JITO_ENGINE_URL = (os.getenv("JITO_ENGINE_URL") or "https://mainnet.block-engine.jito.wtf").strip()
+JITO_TX_URL = JITO_ENGINE_URL.rstrip("/") + "/api/v1/transactions"
+JITO_BUNDLE_URL = JITO_ENGINE_URL.rstrip("/") + "/api/v1/bundles"
+
+JITO_TIP_LAMPORTS = as_int(os.getenv("JITO_TIP_LAMPORTS"), 0)
+JITO_TIP_ACCOUNTS_ENV = (os.getenv("JITO_TIP_ACCOUNTS") or "").strip()
+JITO_TIP_ACCOUNTS: List[str] = []
+if JITO_TIP_ACCOUNTS_ENV:
+    for x in JITO_TIP_ACCOUNTS_ENV.split(","):
+        x = x.strip()
+        if not x:
+            continue
+        try:
+            Pubkey.from_string(x)
+            JITO_TIP_ACCOUNTS.append(x)
+        except Exception:
+            pass
+
+JITO_TIP_CONFIRM = as_bool(os.getenv("JITO_TIP_CONFIRM"), False)
+
+# WSOL balance via WS subscription toggle
+WSOL_WS_BALANCE = as_bool(os.getenv("WSOL_WS_BALANCE"), True)
+
+# ✅ DEBUG маршрутов (убирает DEBUG QUOTE/ENTRY)
+DEBUG_ROUTES = as_bool(os.getenv("DEBUG_ROUTES"), False)
 
 print(f"[KEY CFG] RPC_URL={RPC_URL}")
 print(f"[KEY CFG] RPC_WS_URL={RPC_WS_URL}")
-print(
-    f"[CFG] WATCH_WALLETS={','.join(WATCH_WALLETS)} "
-    f" MIN_WALLET_BUY_SOL={MIN_WALLET_BUY_SOL}  TRIGGER_SELL_SOL={TRIGGER_SELL_SOL}"
-)
-print(
-    f"[CFG] BUY_SOL={BUY_SOL}  SLIPPAGE_BPS={SLIPPAGE_BPS} "
-    f"PRIO_BUY={PRIORITY_FEE_LAMPORTS}  PRIO_SELL={SELL_PRIORITY_FEE_LAMPORTS}"
-)
-print(f"[CFG] AUTO_SELL={AUTO_SELL} TP={TP_PCT}% SL={SL_PCT}% POLL={POLL_SECONDS}s")
+print(f"[CFG] WATCH_WALLETS={','.join(WATCH_WALLETS)} MIN_WALLET_BUY_SOL={MIN_WALLET_BUY_SOL} TRIGGER_SELL_SOL={TRIGGER_SELL_SOL}")
+print(f"[CFG] BUY_WSOL={BUY_WSOL} SLIPPAGE_BPS={SLIPPAGE_BPS} PRIO_BUY={PRIORITY_FEE_LAMPORTS} PRIO_SELL={SELL_PRIORITY_FEE_LAMPORTS}")
+print(f"[CFG] AUTO_SELL={AUTO_SELL} TP={TP_PCT}% SL={SL_PCT}% POLL={POLL_SECONDS}s AUTOSELL_LOG_EVERY_SEC={AUTOSELL_LOG_EVERY_SEC}s")
 print(f"[CFG] JUP_BASES={JUP_BASES} REQUIRE_PUMPFUN={REQUIRE_PUMPFUN} POOL_AMM_ID={POOL_AMM_ID}")
-print(
-    f"[CFG] ONE_SELL_DROP_MIN_PCT={ONE_SELL_DROP_MIN_PCT}  "
-    f"ONE_SELL_DROP_MAX_PCT={ONE_SELL_DROP_MAX_PCT}  MIN_LIQ_USD={MIN_LIQ_USD}"
-)
-print(
-    f"[CFG] MIN_SELL_SHARE_PCT={MIN_SELL_SHARE_PCT}  "
-    f"SOL_PRICE_USD≈{SOL_PRICE_USD}"
-)
+print(f"[CFG] MIN_LIQ_USD={MIN_LIQ_USD} MIN_SELL_SHARE_PCT={MIN_SELL_SHARE_PCT} SOL_PRICE_USD≈{SOL_PRICE_USD}")
+print(f"[CFG] LIQ_TTL_SEC={LIQ_TTL_SEC} LIQ_REFRESH_SEC={LIQ_REFRESH_SEC} LIQ_REFRESH_CONCURRENCY={LIQ_REFRESH_CONCURRENCY}")
+print(f"[CFG] DEBUG_ROUTES={DEBUG_ROUTES}")
+print(f"[JITO] USE_JITO_SEND={USE_JITO_SEND} JITO_ENGINE_URL={JITO_ENGINE_URL} JITO_UUID={JITO_UUID}")
+print(f"[JITO TIP] tip_lamports={JITO_TIP_LAMPORTS} tip_accounts_env={len(JITO_TIP_ACCOUNTS)} confirm={JITO_TIP_CONFIRM}")
+print(f"[WSOL-WS] enabled={WSOL_WS_BALANCE}")
+
 
 # ==========================
 # KEYPAIR
 # ==========================
-
 
 def load_keypair() -> SoldersKeypair:
     try:
@@ -199,6 +243,7 @@ KP = load_keypair()
 MY_PUBKEY = str(KP.pubkey())
 print(f"[KEY] Паблик бота: {MY_PUBKEY}")
 
+
 # ==========================
 # watched_tokens.json + positions.json
 # ==========================
@@ -206,26 +251,17 @@ print(f"[KEY] Паблик бота: {MY_PUBKEY}")
 TOKENS_FILE = Path(__file__).with_name("watched_tokens.json")
 POSITIONS_FILE = Path(__file__).with_name("positions.json")
 
+WATCH_LOCK = asyncio.Lock()  # защита WATCHED_MINTS + SUBSCRIBED_TOKENS
+
 
 def load_watched_mints() -> List[str]:
-    """
-    Читает watched_tokens.json. Формат:
-    {
-      "tokens": [
-        "mint1",
-        "mint2"
-      ]
-    }
-    Если файл битый / пустой — просто возвращаем [] и работаем дальше.
-    """
     if not TOKENS_FILE.exists():
         print("[TOKENS] watched_tokens.json не найден (начинаем с нуля).")
         return []
     try:
         data = json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
         tokens = data.get("tokens") or []
-        res = [str(m).strip() for m in tokens if str(m).strip()]
-        return res
+        return [str(m).strip() for m in tokens if str(m).strip()]
     except json.JSONDecodeError:
         print("[TOKENS] watched_tokens.json повреждён или пустой, игнорирую содержимое.")
         return []
@@ -236,28 +272,43 @@ def load_watched_mints() -> List[str]:
 
 def save_watched_mints(mints: List[str]) -> None:
     mset = sorted(set(mints))
-    TOKENS_FILE.write_text(
-        json.dumps({"tokens": mset}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    TOKENS_FILE.write_text(json.dumps({"tokens": mset}, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[TOKENS] Сохранено {len(mset)} токенов в watched_tokens.json")
 
 
 WATCHED_MINTS: List[str] = load_watched_mints()
-if WATCHED_MINTS:
-    print(f"[TOKENS] Загружено {len(WATCHED_MINTS)} токенов из watched_tokens.json")
-else:
-    print("[TOKENS] Список токенов пуст.")
-
+print(
+    f"[TOKENS] Загружено {len(WATCHED_MINTS)} токенов из watched_tokens.json"
+    if WATCHED_MINTS
+    else "[TOKENS] Список токенов пуст."
+)
 SUBSCRIBED_TOKENS: set[str] = set(WATCHED_MINTS)
 
+
+async def add_watched_mint_async(mint: str):
+    """Добавление mint в watchlist + сохранение на диск — НЕ блокирует WS loop."""
+    async with WATCH_LOCK:
+        if mint in WATCHED_MINTS:
+            return
+        WATCHED_MINTS.append(mint)
+        mints_snapshot = list(WATCHED_MINTS)
+    await asyncio.to_thread(save_watched_mints, mints_snapshot)
+    print(f"[TOKENS] Добавлен mint в watch-лист: {mint}")
+
+
 # ==========================
-# PRICE CACHE + JUPITER COOLDOWN
+# PRICE CACHE + MINT PROGRAM CACHE
 # ==========================
 
-TOKEN_PRICE_CACHE: Dict[str, float] = {}       # mint -> last price (WSOL per token)
-TOKEN_DECIMALS_CACHE: Dict[str, int] = {}     # mint -> decimals
-LIQ_CACHE: Dict[str, Tuple[float, float]] = {}  # mint -> (liq_usd, sol_in_pool_est)
+TOKEN_DECIMALS_CACHE: Dict[str, int] = {}
+
+# mint -> "legacy" | "2022"
+MINT_TOKEN_PROGRAM_CACHE: Dict[str, Pubkey] = {}
+MINT_TOKEN_PROGRAM_LOCK = asyncio.Lock()
+
+# LIQ_CACHE[mint] = (liq_usd, sol_in_pool_est, ts_epoch)
+LIQ_CACHE: Dict[str, Tuple[float, float, float]] = {}
+LIQ_LOCK = asyncio.Lock()
 
 JUP_RATE_LIMIT_UNTIL: float = 0.0
 
@@ -287,6 +338,14 @@ JUP_SESSION.headers.update(
 
 RPC_SESSION = requests.Session()
 DEX_SESSION = requests.Session()
+
+JITO_SESSION = requests.Session()
+JITO_SESSION.headers.update(
+    {
+        "content-type": "application/json",
+        "x-jito-auth": JITO_UUID,
+    }
+)
 
 
 def rpc_call(method: str, params):
@@ -340,29 +399,83 @@ def http_post_with_fallback(path: str, json_body: dict, timeout=25, retries=2, b
 
 
 # ==========================
+# MINT -> TOKEN PROGRAM (legacy vs 2022)
+# ==========================
+
+def get_mint_token_program_sync(mint: str) -> Pubkey:
+    """
+    Определяет token program mint'а по owner mint-аккаунта.
+    - Tokenkeg... -> legacy SPL Token
+    - TokenzQd... -> Token-2022
+    """
+    if mint in MINT_TOKEN_PROGRAM_CACHE:
+        return MINT_TOKEN_PROGRAM_CACHE[mint]
+
+    res = rpc_call("getAccountInfo", [mint, {"encoding": "base64", "commitment": "processed"}])
+    value = res.get("value")
+    if not value:
+        # если mint не существует/пусто — по умолчанию legacy, чтобы не падать
+        prog = TOKEN_PROGRAM_LEGACY
+        MINT_TOKEN_PROGRAM_CACHE[mint] = prog
+        return prog
+
+    owner = (value.get("owner") or "").strip()
+    if owner == str(TOKEN_PROGRAM_2022):
+        prog = TOKEN_PROGRAM_2022
+    else:
+        # большинство — legacy
+        prog = TOKEN_PROGRAM_LEGACY
+
+    MINT_TOKEN_PROGRAM_CACHE[mint] = prog
+    return prog
+
+
+async def get_mint_token_program(mint: str) -> Pubkey:
+    # кэш + lock, чтобы не дергать RPC многократно при пике
+    if mint in MINT_TOKEN_PROGRAM_CACHE:
+        return MINT_TOKEN_PROGRAM_CACHE[mint]
+    async with MINT_TOKEN_PROGRAM_LOCK:
+        if mint in MINT_TOKEN_PROGRAM_CACHE:
+            return MINT_TOKEN_PROGRAM_CACHE[mint]
+        prog = await asyncio.to_thread(get_mint_token_program_sync, mint)
+        MINT_TOKEN_PROGRAM_CACHE[mint] = prog
+        return prog
+
+
+def get_ata_address(mint: str, owner: str, token_program: Pubkey) -> str:
+    mint_pk = Pubkey.from_string(mint)
+    owner_pk = Pubkey.from_string(owner)
+    ata_pk, _ = Pubkey.find_program_address(
+        [bytes(owner_pk), bytes(token_program), bytes(mint_pk)],
+        ASSOCIATED_TOKEN_PROGRAM_ID,
+    )
+    return str(ata_pk)
+
+
+# ==========================
 # LIQUIDITY (Dexscreener)
 # ==========================
 
-def get_liquidity_info(mint: str) -> Tuple[float, float]:
+def get_liquidity_info(mint: str) -> Optional[Tuple[float, float]]:
     """
-    Возвращает (liq_usd, sol_in_pool_est).
-
-    liq_usd – максимальная ликвидность по Solana-парам из Dexscreener.
-    sol_in_pool_est – грубая оценка количества SOL в пуле, исходя из:
-      liq_usd ≈ 2 * sol_in_pool * SOL_PRICE_USD
-      => sol_in_pool ≈ liq_usd / (2 * SOL_PRICE_USD)
+    Возвращает (liq_usd, sol_in_pool_est) или None при 429/ошибке.
+    Важно: None не должно попадать в кэш, иначе ты "закэшируешь нули".
     """
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
         r = DEX_SESSION.get(url, timeout=7)
+
+        if r.status_code == 429:
+            print(f"[DEX LIQ] 429 rate limit (skip) mint={mint}")
+            return None
+
         r.raise_for_status()
         j = r.json()
         pairs = j.get("pairs") or []
         if not pairs:
-            return 0.0, 0.0
+            return (0.0, 0.0)
 
         best_liq = None
-        best_pair = None
         for p in pairs:
             chain = (p.get("chainId") or "").lower()
             if chain not in ("solana", "sol"):
@@ -376,53 +489,68 @@ def get_liquidity_info(mint: str) -> Tuple[float, float]:
                 continue
             if best_liq is None or liq_f > best_liq:
                 best_liq = liq_f
-                best_pair = p
 
         if best_liq is None:
-            p0 = pairs[0]
-            liq0 = (p0.get("liquidity") or {}).get("usd")
-            if liq0 is None:
-                return 0.0, 0.0
-            best_liq = float(liq0)
-            best_pair = p0
+            return (0.0, 0.0)
 
-        # Грубая оценка SOL в пуле: считаем, что пул примерно 50/50.
-        if SOL_PRICE_USD > 0:
-            sol_in_pool_est = best_liq / (2.0 * SOL_PRICE_USD)
-        else:
-            sol_in_pool_est = 0.0
+        sol_in_pool_est = best_liq / (2.0 * SOL_PRICE_USD) if SOL_PRICE_USD > 0 else 0.0
+        return (float(best_liq), float(sol_in_pool_est))
 
-        return float(best_liq), float(sol_in_pool_est)
     except Exception as e:
         print(f"[DEX LIQ] Ошибка Dexscreener для {mint}: {e}")
-        return 0.0, 0.0
+        return None
 
 
-def get_liquidity_info_cached(mint: str) -> Tuple[float, float]:
-    """
-    Кэшируем ликвидность по mint. Dexscreener дергается максимум 1 раз на токен за запуск.
-    """
-    if mint in LIQ_CACHE:
-        return LIQ_CACHE[mint]
-    liq, sol_est = get_liquidity_info(mint)
-    LIQ_CACHE[mint] = (liq, sol_est)
-    return liq, sol_est
+async def get_liquidity_cached_fast(mint: str) -> Tuple[float, float, bool]:
+    """Возвращает (liq, sol_est, from_cache)."""
+    now = time.time()
+    async with LIQ_LOCK:
+        if mint in LIQ_CACHE:
+            liq, sol_est, ts = LIQ_CACHE[mint]
+            if (now - ts) <= LIQ_TTL_SEC:
+                return liq, sol_est, True
+
+    res = await asyncio.to_thread(get_liquidity_info, mint)
+
+    # 429/ошибка: верни старое, а если его нет — 0, но НЕ кэшируй
+    if res is None:
+        async with LIQ_LOCK:
+            if mint in LIQ_CACHE:
+                liq, sol_est, ts = LIQ_CACHE[mint]
+                return liq, sol_est, True
+        return 0.0, 0.0, False
+
+    liq, sol_est = res
+    async with LIQ_LOCK:
+        LIQ_CACHE[mint] = (liq, sol_est, time.time())
+    return liq, sol_est, False
 
 
-def get_liquidity_usd(mint: str) -> float:
-    liq, _ = get_liquidity_info_cached(mint)
-    return liq
+async def liquidity_refresher():
+    """Фоновое обновление ликвидности."""
+    sem = asyncio.Semaphore(max(1, LIQ_REFRESH_CONCURRENCY))
 
+    async def refresh_one(m: str):
+        async with sem:
+            res = await asyncio.to_thread(get_liquidity_info, m)
+            if res is None:
+                return  # не кэшируем "ошибки/429"
+            liq, sol_est = res
+            async with LIQ_LOCK:
+                LIQ_CACHE[m] = (liq, sol_est, time.time())
 
-# ==========================
-# WATCH LIST
-# ==========================
-
-def add_watched_mint(mint: str):
-    if mint not in WATCHED_MINTS:
-        WATCHED_MINTS.append(mint)
-        save_watched_mints(WATCHED_MINTS)
-        print(f"[TOKENS] Добавлен mint в watch-лист: {mint}")
+    while True:
+        try:
+            async with WATCH_LOCK:
+                mints = list(set(WATCHED_MINTS) | set(SUBSCRIBED_TOKENS))
+            if mints:
+                tasks = [asyncio.create_task(refresh_one(m)) for m in mints]
+                await asyncio.wait(tasks, timeout=10.0)
+            await asyncio.sleep(max(2.0, LIQ_REFRESH_SEC))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(2.0)
 
 
 # ==========================
@@ -430,6 +558,8 @@ def add_watched_mint(mint: str):
 # ==========================
 
 def _debug_print_route(obj: dict, tag: str):
+    if not DEBUG_ROUTES:
+        return
     rp = obj.get("routePlan") or []
     print(f"DEBUG {tag}: hops={len(rp)}")
     for i, hop in enumerate(rp, 1):
@@ -457,8 +587,7 @@ def _filter_routes_pumpfun_strict(obj: dict, require_pump: bool, pool_amm_id: Op
                 return obj
 
     raise RuntimeError(
-        "Маршрут через Pump.fun не найден"
-        + (f" (требовался пул {pool_amm_id})" if pool_amm_id else "")
+        "Маршрут через Pump.fun не найден" + (f" (требовался пул {pool_amm_id})" if pool_amm_id else "")
     )
 
 
@@ -469,13 +598,6 @@ def jup_quote_pump_only(
     require_pump: Optional[bool] = None,
     pool_amm_id: Optional[str] = None,
 ) -> dict:
-    """
-    "Тяжёлый", но надёжный квотер — используется для:
-    - get_token_price_wsol (цена)
-    - autosell (SELL)
-
-    Для входа мы используем более быстрый jup_quote_for_entry.
-    """
     if require_pump is None:
         require_pump = REQUIRE_PUMPFUN
     if pool_amm_id is None:
@@ -488,61 +610,31 @@ def jup_quote_pump_only(
         "slippageBps": SLIPPAGE_BPS,
     }
 
-    fast_variants = [
+    variants = [
         {**base},
         {**base, "onlyDirectRoutes": "true"},
         {**base, "dexes": "pump"},
         {**base, "dexes": ["pump", "pump.fun"]},
-    ]
-    fallback_variants = [
-        {**base},
         {**base, "excludeDexes": "meteora"},
         {**base, "excludeDexes": ["meteora"]},
     ]
 
-    last_err = None
-    max_rounds = 2
+    last_err: Optional[Exception] = None
+    for idx, params in enumerate(variants, 1):
+        try:
+            r = http_get_with_fallback("/swap/v1/quote", params=params, timeout=10)
+            r.raise_for_status()
+            obj = r.json()
+            _debug_print_route(obj, f"QUOTE v{idx}")
+            return _filter_routes_pumpfun_strict(obj, require_pump, pool_amm_id)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 429:
+                raise RuntimeError("Jupiter 429 Too Many Requests") from e
+            last_err = e
+        except Exception as e:
+            last_err = e
 
-    # FAST
-    for round_idx in range(max_rounds):
-        for var_idx, params in enumerate(fast_variants, 1):
-            try:
-                r = http_get_with_fallback("/swap/v1/quote", params=params, timeout=10)
-                r.raise_for_status()
-                obj = r.json()
-                _debug_print_route(obj, f"FAST r{round_idx+1}/v{var_idx}")
-                return _filter_routes_pumpfun_strict(obj, require_pump, pool_amm_id)
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
-                    raise RuntimeError("Jupiter 429 Too Many Requests") from e
-                last_err = e
-                time.sleep(0.15 + 0.1 * round_idx)
-            except Exception as e:
-                last_err = e
-                time.sleep(0.15 + 0.1 * round_idx)
-
-    # FALLBACK
-    for round_idx in range(max_rounds):
-        for var_idx, params in enumerate(fallback_variants, 1):
-            try:
-                r = http_get_with_fallback("/swap/v1/quote", params=params, timeout=10)
-                r.raise_for_status()
-                obj = r.json()
-                _debug_print_route(obj, f"FALLBACK r{round_idx+1}/v{var_idx}")
-                return _filter_routes_pumpfun_strict(obj, require_pump, pool_amm_id)
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 429:
-                    raise RuntimeError("Jupiter 429 Too Many Requests") from e
-                last_err = e
-                time.sleep(0.2 + 0.1 * round_idx)
-            except Exception as e:
-                last_err = e
-                time.sleep(0.2 + 0.1 * round_idx)
-
-    if isinstance(last_err, RuntimeError):
-        raise last_err
-
-    raise RuntimeError("Маршрут не найден через Jupiter после нескольких попыток.")
+    raise RuntimeError(f"QUOTE_FAILED: {last_err}")
 
 
 def jup_quote_for_entry(
@@ -552,16 +644,7 @@ def jup_quote_for_entry(
     require_pump: Optional[bool] = None,
     pool_amm_id: Optional[str] = None,
 ) -> dict:
-    """
-    УПРОЩЁННЫЙ, БЫСТРЫЙ квотер ДЛЯ ВХОДА.
-
-    — минимум параметров;
-    — не пытаемся жёстко втащить Pump.fun (для скорости);
-    — 1–2 быстрые попытки к /swap/v1/quote;
-    — если маршрут не найден → просто ENTRY_QUOTE_FAILED, сигнал скипаем.
-    """
     if require_pump is None:
-        # Для входа по сигналу нам теперь важнее СКОРОСТЬ, а не жёсткий Pump.fun.
         require_pump = False
     if pool_amm_id is None:
         pool_amm_id = None
@@ -573,46 +656,33 @@ def jup_quote_for_entry(
         "slippageBps": SLIPPAGE_BPS,
     }
 
-    # Очень простой набор вариантов: без лишних фильтров.
     variants = [
-        {**base},  # обычный маршрут
-        {**base, "onlyDirectRoutes": "true"},  # прямой маршрут, если есть
+        {**base},
+        {**base, "onlyDirectRoutes": "true"},
+        {**base, "dexes": "pump"},
+        {**base, "dexes": ["pump", "pump.fun"]},
+        {**base, "excludeDexes": "meteora"},
     ]
 
     last_err: Optional[Exception] = None
-
     for idx, params in enumerate(variants, 1):
         try:
-            r = http_get_with_fallback("/swap/v1/quote", params=params, timeout=6)
+            r = http_get_with_fallback("/swap/v1/quote", params=params, timeout=8)
             r.raise_for_status()
             obj = r.json()
             _debug_print_route(obj, f"ENTRY v{idx}")
-            # Если вдруг всё-таки хочешь иногда требовать Pump, фильтр учитывает require_pump
             return _filter_routes_pumpfun_strict(obj, require_pump, pool_amm_id)
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 429:
-                # 429 — сразу выбрасываем, чтобы выше можно было включить кулдаун
                 raise RuntimeError("Jupiter 429 Too Many Requests") from e
             last_err = e
         except Exception as e:
             last_err = e
 
-    if isinstance(last_err, RuntimeError):
-        raise last_err
-
-    raise RuntimeError("ENTRY_QUOTE_FAILED")
+    raise RuntimeError(f"ENTRY_QUOTE_FAILED: {last_err}")
 
 
-def jup_swap(
-    route_obj: dict,
-    user_pubkey: str,
-    priority_fee_lamports: Optional[int] = None,
-) -> str:
-    """
-    priority_fee_lamports:
-      - None -> использовать глобальный PRIORITY_FEE_LAMPORTS (для покупок);
-      - число -> использовать его (например SELL_PRIORITY_FEE_LAMPORTS для продаж).
-    """
+def jup_swap(route_obj: dict, user_pubkey: str, priority_fee_lamports: Optional[int] = None) -> str:
     if priority_fee_lamports is None:
         priority_fee_lamports = PRIORITY_FEE_LAMPORTS
 
@@ -628,7 +698,9 @@ def jup_swap(
     }
 
     r = http_post_with_fallback("/swap/v1/swap", json_body=body, timeout=25)
-    r.raise_for_status()
+    if r.status_code != 200:
+        raise RuntimeError(f"Jupiter swap HTTP {r.status_code}: {r.text}")
+
     data = r.json()
     tx_b64 = data.get("swapTransaction")
     if not tx_b64:
@@ -637,7 +709,7 @@ def jup_swap(
 
 
 # ==========================
-# BALANCES / ATA
+# BALANCES
 # ==========================
 
 def get_mint_decimals(mint: str) -> int:
@@ -655,15 +727,18 @@ def get_mint_decimals_cached(mint: str) -> int:
 
 
 def get_token_balance_raw(mint: str, owner: str) -> tuple[int, int]:
+    """
+    Возвращает баланс по mint у owner.
+    Важно: getTokenAccountsByOwner с фильтром mint вернёт токен-аккаунты,
+    независимо от token program (legacy/2022). Мы берём ПЕРВЫЙ — это ок
+    для большинства кейсов, но на всякий случай можно заменить на max по amount.
+    """
     res = rpc_call(
         "getTokenAccountsByOwner",
         [
             owner,
             {"mint": mint},
-            {
-                "encoding": "jsonParsed",
-                "commitment": "processed",
-            },
+            {"encoding": "jsonParsed", "commitment": "processed"},
         ],
     )
     value = res.get("value") or []
@@ -678,21 +753,155 @@ def get_token_balance_raw(mint: str, owner: str) -> tuple[int, int]:
     return amount, decimals
 
 
-def get_ata_address(mint: str, owner: str) -> str:
-    mint_pk = Pubkey.from_string(mint)
-    owner_pk = Pubkey.from_string(owner)
-    ata_pk, _ = Pubkey.find_program_address(
-        [bytes(owner_pk), bytes(TOKEN_PROGRAM_ID), bytes(mint_pk)],
-        ASSOCIATED_TOKEN_PROGRAM_ID,
-    )
-    return str(ata_pk)
+# --- WSOL: ATA всегда через legacy program ---
+WSOL_ATA: Optional[str] = None
+WSOL_ACCOUNT: Optional[str] = None  # реальный токен-аккаунт с WSOL (может быть НЕ ATA)
+
+def find_best_wsol_account(owner: str) -> Optional[str]:
+    """Находит лучший (самый большой по amount) WSOL token account у owner."""
+    try:
+        res = rpc_call(
+            "getTokenAccountsByOwner",
+            [owner, {"mint": WSOL_MINT}, {"encoding": "jsonParsed", "commitment": "processed"}],
+        )
+        best_pk = None
+        best_amt = -1
+        for it in (res.get("value") or []):
+            pk = it.get("pubkey")
+            info = it.get("account", {}).get("data", {}).get("parsed", {}).get("info", {})
+            ta = info.get("tokenAmount") or {}
+            amt = int(ta.get("amount", "0") or "0")
+            if amt > best_amt:
+                best_amt = amt
+                best_pk = pk
+        return best_pk
+    except Exception:
+        return None
+
+
+try:
+    WSOL_ATA = get_ata_address(WSOL_MINT, MY_PUBKEY, TOKEN_PROGRAM_LEGACY)
+    print(f"[WSOL] ATA(legacy) = {WSOL_ATA}")
+except Exception as e:
+    print(f"[WSOL] Не удалось посчитать ATA(legacy): {e}")
+    WSOL_ATA = None
+
+
+def get_wsol_balance_lamports(owner: str) -> int:
+    bal_raw, _ = get_token_balance_raw(WSOL_MINT, owner)
+    return int(bal_raw)
+
+
+def get_wsol_balance_fast(owner: str) -> int:
+    """Быстрый WSOL баланс:
+    1) если найден реальный WSOL_ACCOUNT — читаем его
+    2) иначе пробуем WSOL_ATA (legacy)
+    3) иначе фолбэк на getTokenAccountsByOwner
+    """
+    global WSOL_ACCOUNT, WSOL_ATA
+
+    if WSOL_ACCOUNT:
+        try:
+            res = rpc_call("getTokenAccountBalance", [WSOL_ACCOUNT, {"commitment": "processed"}])
+            val = res.get("value") or {}
+            return int(val.get("amount", "0") or "0")
+        except Exception:
+            pass
+
+    if WSOL_ATA:
+        try:
+            res = rpc_call("getTokenAccountBalance", [WSOL_ATA, {"commitment": "processed"}])
+            val = res.get("value") or {}
+            return int(val.get("amount", "0") or "0")
+        except Exception:
+            pass
+
+    return get_wsol_balance_lamports(owner)
+
+
+# --- WS подписка на WSOL account (0 RPC запросов в hot-path) ---
+WSOL_BALANCE_LAMPORTS: int = 0
+WSOL_BALANCE_READY: bool = False
+
+
+async def wsol_balance_ws_listener():
+    global WSOL_BALANCE_LAMPORTS, WSOL_BALANCE_READY
+
+    if not WSOL_WS_BALANCE:
+        print("[WSOL-WS] выключено (WSOL_WS_BALANCE=false).")
+        return
+
+    target = WSOL_ACCOUNT or WSOL_ATA
+    if not target:
+        print("[WSOL-WS] нет WSOL_ACCOUNT/WSOL_ATA, подписка невозможна.")
+        return
+
+    backoff = 1.0
+    while True:
+        try:
+            print(f"[WSOL-WS] subscribe {target} @ {RPC_WS_URL}")
+            async with websockets.connect(RPC_WS_URL, ping_interval=20, ping_timeout=20) as ws:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "accountSubscribe",
+                            "params": [target, {"encoding": "jsonParsed", "commitment": "processed"}],
+                        }
+                    )
+                )
+
+                # initial
+                try:
+                    WSOL_BALANCE_LAMPORTS = int(get_wsol_balance_fast(MY_PUBKEY))
+                    WSOL_BALANCE_READY = True
+                except Exception:
+                    pass
+
+                backoff = 1.0
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    if not isinstance(msg, dict):
+                        continue
+                    if msg.get("method") != "accountNotification":
+                        continue
+
+                    info = (
+                        (msg.get("params") or {})
+                        .get("result", {})
+                        .get("value", {})
+                        .get("data", {})
+                        .get("parsed", {})
+                        .get("info", {})
+                        .get("tokenAmount", {})
+                    )
+
+                    try:
+                        WSOL_BALANCE_LAMPORTS = int(info.get("amount", "0") or "0")
+                        WSOL_BALANCE_READY = True
+                    except Exception:
+                        continue
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            WSOL_BALANCE_READY = False
+            print(f"[WSOL-WS] ошибка: {e} (reconnect in {backoff:.1f}s)")
+            await asyncio.sleep(backoff)
+            backoff = min(15.0, backoff * 1.7)
 
 
 async def wait_for_token_via_ws(mint: str, owner: str, timeout: float = 30.0) -> tuple[int, int]:
-    ata = get_ata_address(mint, owner)
-    print(f"[WS-ATA] ATA для {mint} и {owner}: {ata}")
+    # ATA считаем по РЕАЛЬНОМУ token program этого mint
+    prog = await get_mint_token_program(mint)
+    ata = get_ata_address(mint, owner, prog)
+    print(f"[WS-ATA] mint={mint} program={'2022' if prog == TOKEN_PROGRAM_2022 else 'legacy'} ATA={ata}")
 
-    bal_raw, dec = get_token_balance_raw(mint, owner)
+    bal_raw, dec = await asyncio.to_thread(get_token_balance_raw, mint, owner)
     if bal_raw > 0:
         print(f"[WS-ATA] Уже есть баланс токена (HTTP): raw={bal_raw}")
         return bal_raw, dec
@@ -704,19 +913,13 @@ async def wait_for_token_via_ws(mint: str, owner: str, timeout: float = 30.0) ->
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "accountSubscribe",
-                "params": [
-                    ata,
-                    {
-                        "encoding": "jsonParsed",
-                        "commitment": "processed",
-                    },
-                ],
+                "params": [ata, {"encoding": "jsonParsed", "commitment": "processed"}],
             }
             await ws.send(json.dumps(sub))
             start_ts = time.time()
             while True:
                 if timeout and (time.time() - start_ts) > timeout:
-                    print(f"[WS-ATA] Таймаут ожидания уведомления по {ata}, фолбэк на polling.")
+                    print(f"[WS-ATA] Таймаут по {ata}, фолбэк на polling.")
                     break
 
                 raw = await ws.recv()
@@ -743,111 +946,138 @@ async def wait_for_token_via_ws(mint: str, owner: str, timeout: float = 30.0) ->
                 except Exception:
                     amount = 0
 
-                print(f"[WS-ATA] accountNotification по {ata}: amount={amount}, decimals={decimals}")
+                print(f"[WS-ATA] accountNotification {ata}: amount={amount}, decimals={decimals}")
                 if amount > 0:
                     print(f"[WS-ATA] Токен {mint} появился на кошельке, raw={amount}")
                     return amount, decimals
     except Exception as e:
-        print(f"[WS-ATA] Ошибка WS-подписки по ATA {ata}: {e}")
+        print(f"[WS-ATA] Ошибка WS accountSubscribe {ata}: {e}")
 
-    print("[WS-ATA] Перехожу к HTTP polling’у баланса токена…")
+    print("[WS-ATA] Переход к HTTP polling баланса…")
     while True:
-        bal_raw, dec = get_token_balance_raw(mint, owner)
+        bal_raw, dec = await asyncio.to_thread(get_token_balance_raw, mint, owner)
         if bal_raw > 0:
-            print(f"[WS-ATA] Токен обнаружен при polling: raw={bal_raw}")
+            print(f"[WS-ATA] Токен обнаружен polling: raw={bal_raw}")
             return bal_raw, dec
         await asyncio.sleep(POLL_SECONDS)
 
 
 # ==========================
-# TOKEN PRICE via Jupiter (с кулдауном)
+# JITO TIP ACCOUNTS
 # ==========================
 
-def get_token_price_wsol(mint: str) -> float:
-    """
-    Получает цену токена в WSOL за 1 токен.
-    Сначала пробуем маршрут через Pump.fun, если его нет — любой маршрут.
-    Если Jupiter даёт 429 — включаем глобальный кулдаун.
-    """
-    if jup_in_cooldown():
-        raise RuntimeError("Jupiter cooldown active")
+def jito_get_tip_accounts() -> List[str]:
+    if JITO_TIP_ACCOUNTS:
+        return JITO_TIP_ACCOUNTS
 
-    dec = get_mint_decimals_cached(mint)
-    amount_smallest = 10 ** dec  # 1 токен
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "getTipAccounts", "params": []}
+    r = JITO_SESSION.post(JITO_BUNDLE_URL, json=payload, timeout=(2, 6))
+    if r.status_code != 200:
+        raise RuntimeError(f"getTipAccounts HTTP {r.status_code}: {r.text}")
+
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(f"getTipAccounts error: {j['error']}")
+
+    res = j.get("result")
+    if not isinstance(res, list):
+        raise RuntimeError(f"getTipAccounts unexpected result: {j}")
+
+    valid: List[str] = []
+    for s in res:
+        if not isinstance(s, str):
+            continue
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            Pubkey.from_string(s)
+            valid.append(s)
+        except Exception:
+            continue
+
+    if not valid:
+        raise RuntimeError("getTipAccounts вернул 0 валидных pubkey (проверь endpoint или задай JITO_TIP_ACCOUNTS).")
+
+    return valid
+
+
+def pick_jito_tip_account() -> str:
+    tips = jito_get_tip_accounts()
+    return random.choice(tips)
+
+
+def _get_recent_blockhash() -> Hash:
+    res = rpc_call("getLatestBlockhash", [{"commitment": "processed"}])
+    bh = (res.get("value") or {}).get("blockhash")
+    if not bh:
+        raise RuntimeError(f"getLatestBlockhash без blockhash: {res}")
+    return Hash.from_string(bh)
+
+
+def build_tip_tx_b64_signed(tip_lamports: int) -> str:
+    tip_to = pick_jito_tip_account()
+    to_pk = Pubkey.from_string(tip_to)
+    payer = KP.pubkey()
+
+    ix = sys_transfer(TransferParams(from_pubkey=payer, to_pubkey=to_pk, lamports=tip_lamports))
+    recent = _get_recent_blockhash()
+
+    tx = SoldersLegacyTx.new_signed_with_payer([ix], payer, [KP], recent)
 
     try:
-        quote = jup_quote_pump_only(
-            input_mint=mint,
-            output_mint=WSOL_MINT,
-            amount_smallest=amount_smallest,
-            require_pump=True,
-            pool_amm_id=None,
-        )
-    except RuntimeError as e:
-        msg = str(e)
-        if "Jupiter 429 Too Many Requests" in msg:
-            print(f"[PRICE] Jupiter 429 при попытке взять цену {mint}, включаю кулдаун 10с")
-            jup_set_cooldown(10.0)
-            raise
-        if "Маршрут через Pump.fun не найден" not in msg:
-            raise
+        wire = bytes(tx)
+    except Exception:
+        wire = tx.to_bytes()
 
-        try:
-            quote = jup_quote_pump_only(
-                input_mint=mint,
-                output_mint=WSOL_MINT,
-                amount_smallest=amount_smallest,
-                require_pump=False,
-                pool_amm_id=None,
-            )
-        except RuntimeError as e2:
-            msg2 = str(e2)
-            if "Jupiter 429 Too Many Requests" in msg2:
-                print(f"[PRICE] Jupiter 429 даже на fallback для {mint}, кулдаун 10с")
-                jup_set_cooldown(10.0)
-            raise
-
-    out_lamports = int(quote.get("outAmount", "0") or "0")
-    if out_lamports <= 0:
-        raise RuntimeError(f"Jupiter вернул outAmount=0 для mint={mint}")
-
-    price_wsol = out_lamports / 1_000_000_000  # WSOL за 1 токен
-    return price_wsol
+    return base64.b64encode(wire).decode()
 
 
 # ==========================
 # SEND TX
 # ==========================
 
-def send_signed_sync(base64_tx: str) -> str:
+def _sign_swap_tx(base64_tx: str) -> str:
     raw = base64.b64decode(base64_tx)
     tx = SoldersVTx.from_bytes(raw)
     tx_signed = SoldersVTx(tx.message, [KP])
-
     try:
-        wire = bytes(tx_signed.serialize())
-    except Exception:
         wire = bytes(tx_signed)
+    except Exception:
+        wire = tx_signed.to_bytes()
+    return base64.b64encode(wire).decode()
 
-    b64_signed = base64.b64encode(wire).decode()
 
-    send_opts = {
-        "encoding": "base64",
-        "skipPreflight": SKIP_PREFLIGHT,
-        "preflightCommitment": "processed" if FAST_CONFIRM else "confirmed",
+def _send_via_jito(base64_signed_tx: str) -> str:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "sendTransaction",
+        "params": [base64_signed_tx, {"encoding": "base64"}],
     }
 
-    sig_str = rpc_call("sendTransaction", [b64_signed, send_opts])
-    print("⛓ sent:", sig_str)
+    url = f"{JITO_TX_URL}?uuid={JITO_UUID}"
+    r = JITO_SESSION.post(url, json=payload, timeout=(2, 8))
+    if r.status_code != 200:
+        raise RuntimeError(f"Jito HTTP {r.status_code}: {r.text}")
 
+    j = r.json()
+    if "error" in j:
+        raise RuntimeError(f"Jito sendTransaction error: {j['error']}")
+    sig = j.get("result")
+    if not sig:
+        raise RuntimeError(f"Jito sendTransaction: нет result в ответе: {j}")
+
+    print(f"⚡ SENT VIA JITO/SHREDSTREAM: {sig}")
+    return sig
+
+
+def _confirm_signature(sig_str: str) -> str:
     deadline = time.time() + 40
     last_status = None
 
     while time.time() < deadline:
-        statuses = rpc_call(
-            "getSignatureStatuses",
-            [[sig_str], {"searchTransactionHistory": True}],
-        )
+        statuses = rpc_call("getSignatureStatuses", [[sig_str], {"searchTransactionHistory": True}])
         stat = (statuses.get("value") or [None])[0]
         last_status = stat
 
@@ -863,21 +1093,94 @@ def send_signed_sync(base64_tx: str) -> str:
                 if err is None:
                     print(f"✅ success ({conf}) {sig_str}")
                     return sig_str
-                else:
-                    print("❌ on-chain tx error:", err, "sig:", sig_str)
-                    raise RuntimeError(f"Transaction {sig_str} failed on-chain: {err}")
+                raise RuntimeError(f"Transaction {sig_str} failed on-chain: {err}")
         else:
             if conf in ("confirmed", "finalized"):
                 if err is None:
                     print(f"✅ success ({conf}) {sig_str}")
                     return sig_str
-                else:
-                    print("❌ on-chain tx error:", err, "sig:", sig_str)
-                    raise RuntimeError(f"Transaction {sig_str} failed on-chain: {err}")
+                raise RuntimeError(f"Transaction {sig_str} failed on-chain: {err}")
 
         time.sleep(0.4)
 
-    raise RuntimeError(f"Timeout ожидания подтверждения. Последний статус: {last_status}")
+    raise RuntimeError(f"Timeout подтверждения. Последний статус: {last_status}")
+
+
+# --- главный loop для fire-and-forget confirm из worker thread ---
+MAIN_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+async def confirm_in_background(sig: str):
+    try:
+        await asyncio.to_thread(_confirm_signature, sig)
+    except Exception as e:
+        print(f"[CONFIRM BG] tx {sig} failed: {e}")
+
+
+def _schedule_confirm(sig: str):
+    """Надёжно планирует confirm на главном event loop, даже если вызвали из to_thread."""
+    global MAIN_LOOP
+    try:
+        loop = MAIN_LOOP
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(confirm_in_background(sig), loop)
+    except Exception as e:
+        print(f"[CONFIRM BG] schedule failed for {sig}: {e}")
+
+
+def maybe_send_jito_tip_best_effort():
+    if not USE_JITO_SEND or JITO_TIP_LAMPORTS <= 0:
+        return
+    try:
+        tip_b64 = build_tip_tx_b64_signed(JITO_TIP_LAMPORTS)
+        sig = _send_via_jito(tip_b64)
+        print(f"[JITO TIP] sent tip tx sig={sig} lamports={JITO_TIP_LAMPORTS}")
+        if JITO_TIP_CONFIRM:
+            _confirm_signature(sig)
+    except Exception as e:
+        print(f"[JITO TIP] tip send failed (ignored): {e}")
+
+
+def send_signed(base64_tx_from_jup: str) -> str:
+    """Fire-and-forget: возвращает sig сразу после отправки. confirm уезжает в фон."""
+    t0 = time.perf_counter()
+
+    maybe_send_jito_tip_best_effort()
+
+    t_sign = time.perf_counter()
+    b64_signed = _sign_swap_tx(base64_tx_from_jup)
+    sign_ms = round((time.perf_counter() - t_sign) * 1000, 2)
+
+    if USE_JITO_SEND:
+        try:
+            t_send = time.perf_counter()
+            sig = _send_via_jito(b64_signed)
+            send_ms = round((time.perf_counter() - t_send) * 1000, 2)
+            total_ms = round((time.perf_counter() - t0) * 1000, 2)
+            print(f"[SPEED/SEND] sign={sign_ms}ms send={send_ms}ms total={total_ms}ms (fire-and-forget JITO)")
+            _schedule_confirm(sig)
+            return sig
+        except Exception as e:
+            print(f"[JITO] Ошибка отправки через Jito (нет sig): {e}")
+            if not JITO_FALLBACK_RPC:
+                raise
+            print("[JITO] Fallback → обычный RPC sendTransaction")
+
+    send_opts = {
+        "encoding": "base64",
+        "skipPreflight": SKIP_PREFLIGHT,
+        "preflightCommitment": "processed" if FAST_CONFIRM else "confirmed",
+    }
+
+    t_send = time.perf_counter()
+    sig_str = rpc_call("sendTransaction", [b64_signed, send_opts])
+    send_ms = round((time.perf_counter() - t_send) * 1000, 2)
+    total_ms = round((time.perf_counter() - t0) * 1000, 2)
+    print(f"[SPEED/SEND] sign={sign_ms}ms send={send_ms}ms total={total_ms}ms (fire-and-forget RPC)")
+    print("⛓ sent via RPC:", sig_str)
+
+    _schedule_confirm(sig_str)
+    return sig_str
 
 
 # ==========================
@@ -895,12 +1198,14 @@ class EntryState:
 
 ACTIVE_ENTRIES: Dict[str, EntryState] = {}
 
+# anti-double-buy: mint'ы, по которым покупка уже запущена, но позиция ещё не добавлена в ACTIVE_ENTRIES
+PENDING_ENTRIES: set[str] = set()
+PENDING_LOCK = asyncio.Lock()
+
+ENTRY_SEM = asyncio.Semaphore(1)  # чтобы не шло 10 покупок одновременно
+
 
 def save_positions_from_active() -> None:
-    """
-    Сохраняем все активные позиции в positions.json.
-    При перезапуске по ним будут подняты autosell_worker’ы.
-    """
     try:
         payload: Dict[str, Any] = {"positions": {}}
         for mint, entry in ACTIVE_ENTRIES.items():
@@ -912,22 +1217,13 @@ def save_positions_from_active() -> None:
                 "decimals": entry.decimals,
                 "active": entry.active,
             }
-        POSITIONS_FILE.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(
-            f"[POS] Сохранено {len(payload['positions'])} активных позиций в {POSITIONS_FILE.name}"
-        )
+        POSITIONS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[POS] Сохранено {len(payload['positions'])} активных позиций в {POSITIONS_FILE.name}")
     except Exception as e:
         print(f"[POS] Ошибка сохранения позиций: {e}")
 
 
 def restore_autosell_from_disk() -> None:
-    """
-    При старте бота читаем positions.json и поднимаем autosell_worker
-    для всех активных позиций, если включён AUTO_SELL.
-    """
     if not AUTO_SELL:
         print("[POS] AUTO_SELL выключен, сохранённые позиции игнорируются.")
         return
@@ -948,11 +1244,7 @@ def restore_autosell_from_disk() -> None:
                 continue
 
             try:
-                entry_price = float(
-                    p.get("entry_price_wsol_per_token")
-                    or p.get("entry_price")
-                    or 0.0
-                )
+                entry_price = float(p.get("entry_price_wsol_per_token") or 0.0)
             except Exception:
                 entry_price = 0.0
             if entry_price <= 0:
@@ -973,10 +1265,7 @@ def restore_autosell_from_disk() -> None:
             )
             ACTIVE_ENTRIES[mint] = state
             asyncio.create_task(autosell_worker(state))
-            print(
-                f"[POS] Восстановлена позиция по {mint}, "
-                f"entry≈{entry_price:.10f} WSOL/токен"
-            )
+            print(f"[POS] Восстановлена позиция по {mint}, entry≈{entry_price:.10f} WSOL/токен")
     except Exception as e:
         print(f"[POS] Ошибка при восстановлении позиций: {e}")
 
@@ -990,45 +1279,40 @@ async def autosell_worker(entry: EntryState):
 
     bal_raw, dec = await wait_for_token_via_ws(mint, MY_PUBKEY)
     entry.decimals = dec
-    print(f"[AUTOSELL] Обнаружен баланс токена (через WS/HTTP): raw={bal_raw}, decimals={dec}")
+    print(f"[AUTOSELL] Обнаружен баланс токена: raw={bal_raw}, decimals={dec}")
 
     target_up = 1.0 + TP_PCT / 100.0
     target_down = 1.0 - SL_PCT / 100.0
 
+    last_log = 0.0
+
     while entry.active:
-        bal_raw, dec = get_token_balance_raw(mint, MY_PUBKEY)
+        bal_raw, dec = await asyncio.to_thread(get_token_balance_raw, mint, MY_PUBKEY)
         if bal_raw <= 0:
-            print(f"[AUTOSELL] Баланс {mint} = 0, выхожу из цикла.")
+            print(f"[AUTOSELL] Баланс {mint} = 0, выхожу.")
             entry.active = False
-            # Чистим запись о позиции и сохраняем файл
-            if mint in ACTIVE_ENTRIES:
-                del ACTIVE_ENTRIES[mint]
+            ACTIVE_ENTRIES.pop(mint, None)
             save_positions_from_active()
             break
 
         amount_tokens = bal_raw / (10 ** dec)
 
+        timings = {}
         try:
-            quote = jup_quote_pump_only(
-                input_mint=mint,
-                output_mint=WSOL_MINT,
-                amount_smallest=bal_raw,
-                require_pump=True,
-                pool_amm_id=entry.amm_key,
-            )
+            with tlog("quote_ms", timings):
+                quote = await asyncio.to_thread(jup_quote_pump_only, mint, WSOL_MINT, bal_raw, True, entry.amm_key)
         except Exception as e:
             msg = str(e)
-            if "429 Too Many Requests" in msg:
-                print("[AUTOSELL] Jupiter rate-limit (429), пауза 8 секунд...")
+            if "429" in msg:
+                print("[AUTOSELL] Jupiter 429, пауза 8с...")
                 await asyncio.sleep(8.0)
             else:
-                print(f"[AUTOSELL] Ошибка jup_quote_pump_only: {e}")
+                print(f"[AUTOSELL] Ошибка quote: {e}")
                 await asyncio.sleep(POLL_SECONDS)
             continue
 
         out_lamports = int(quote.get("outAmount", "0") or "0")
         if out_lamports <= 0:
-            print("[AUTOSELL] Jupiter вернул outAmount=0, жду...")
             await asyncio.sleep(POLL_SECONDS)
             continue
 
@@ -1036,57 +1320,45 @@ async def autosell_worker(entry: EntryState):
         price = est_wsol / amount_tokens
         ratio = price / entry.entry_price_wsol_per_token
 
-        print(f"[AUTOSELL] price={price:.10f} WSOL/токен ratio={ratio:.4f} (1.0 = вход)")
+        # ✅ меньше спама: лог раз в AUTOSELL_LOG_EVERY_SEC секунд
+        now_t = time.time()
+        if AUTOSELL_LOG_EVERY_SEC <= 0:
+            pass
+        elif (now_t - last_log) >= AUTOSELL_LOG_EVERY_SEC:
+            print(f"[AUTOSELL] price={price:.10f} WSOL/токен ratio={ratio:.4f} quote_ms={timings.get('quote_ms')}ms")
+            last_log = now_t
 
+        do_sell = False
         if ratio >= target_up:
-            print(f"[AUTOSELL] 🎯 TAKE PROFIT ({ratio:.2f}x) — продаю всё в WSOL.")
+            print(f"[AUTOSELL] 🎯 TAKE PROFIT ({ratio:.2f}x) — продаю всё.")
+            do_sell = True
         elif ratio <= target_down:
-            print(f"[AUTOSELL] 🛑 STOP LOSS ({ratio:.2f}x) — продаю всё в WSOL.")
-        else:
+            print(f"[AUTOSELL] 🛑 STOP LOSS ({ratio:.2f}x) — продаю всё.")
+            do_sell = True
+
+        if not do_sell:
             await asyncio.sleep(POLL_SECONDS)
             continue
 
-        # SELL
         try:
-            quote_sell = jup_quote_pump_only(
-                input_mint=mint,
-                output_mint=WSOL_MINT,
-                amount_smallest=bal_raw,
-                require_pump=True,
-                pool_amm_id=entry.amm_key,
-            )
-        except Exception as e:
-            msg = str(e)
-            if "429 Too Many Requests" in msg:
-                print("[AUTOSELL] Jupiter rate-limit (429) при SELL, пауза 8 секунд...")
-                await asyncio.sleep(8.0)
-            else:
-                print(f"[AUTOSELL] Ошибка при запросе quote для SELL: {e}")
-                await asyncio.sleep(POLL_SECONDS)
-            continue
+            timings2 = {}
+            with tlog("quote_sell_ms", timings2):
+                quote_sell = await asyncio.to_thread(jup_quote_pump_only, mint, WSOL_MINT, bal_raw, True, entry.amm_key)
+            with tlog("swap_build_ms", timings2):
+                b64_tx = await asyncio.to_thread(jup_swap, quote_sell, MY_PUBKEY, SELL_PRIORITY_FEE_LAMPORTS)
+            with tlog("send_total_ms", timings2):
+                sig = await asyncio.to_thread(send_signed, b64_tx)
 
-        route = quote_sell.get("routePlan") or []
-        if route:
-            info = route[0].get("swapInfo") or {}
-            label = info.get("label")
-            ammKey = info.get("ammKey")
-            print(f"✅ SELL маршрут: {label} ({ammKey})")
-
-        try:
-            # Продажа: используем отдельную повышенную приоритетную комиссию
-            b64_tx = jup_swap(
-                quote_sell,
-                MY_PUBKEY,
-                priority_fee_lamports=SELL_PRIORITY_FEE_LAMPORTS,
+            print(
+                f"[AUTOSELL] SELL sig={sig} quote={timings2.get('quote_sell_ms')}ms "
+                f"build={timings2.get('swap_build_ms')}ms send={timings2.get('send_total_ms')}ms"
             )
-            sig = send_signed_sync(b64_tx)
-            print(f"[AUTOSELL] Продажа завершена, сигнатура: {sig}")
+
             entry.active = False
-            if mint in ACTIVE_ENTRIES:
-                del ACTIVE_ENTRIES[mint]
+            ACTIVE_ENTRIES.pop(mint, None)
             save_positions_from_active()
         except Exception as e:
-            print(f"[AUTOSELL] Ошибка при отправке SELL-транзакции: {e}")
+            print(f"[AUTOSELL] Ошибка SELL: {e}")
             await asyncio.sleep(POLL_SECONDS)
 
     print(f"[AUTOSELL] Завершён для {mint}")
@@ -1097,89 +1369,119 @@ async def enter_token_on_signal(
     sol_amt: float,
     sell_share_pct: float,
     drop_pct: float,
+    ws_recv_ms_stamp: Optional[int] = None,
 ):
-    lamports_in = int(BUY_SOL * 1_000_000_000)
-    print(
-        f"🔥 [TOKEN {mint}] Сигнал входа: продажа {sol_amt:.4f} SOL "
-        f"({sell_share_pct:.2f}% пула), падение цены {drop_pct:.2f}% (по старому кэшу, можно игнорить). "
-        f"Покупаю на {BUY_SOL} SOL через Jupiter…"
-    )
+    async with ENTRY_SEM:
+        try:
+            # защита от гонок: если позиция уже активна — ничего не делаем
+            st = ACTIVE_ENTRIES.get(mint)
+            if st is not None and st.active:
+                return
 
-    # ============================
-    # ОДИН быстрый квотер через Jupiter (без тяжёлых фоллбеков)
-    # ============================
-    quote: Optional[dict] = None
+            timings = {"ws_recv_ms": ws_recv_ms_stamp or now_ms()}
+            t_total = time.perf_counter()
 
-    try:
-        # Для входа нам важна скорость → require_pump=False (любой нормальный маршрут).
-        quote = jup_quote_for_entry(
-            input_mint=WSOL_MINT,
-            output_mint=mint,
-            amount_smallest=lamports_in,
-            require_pump=False,
-            pool_amm_id=None,
-        )
-    except Exception as e:
-        msg = str(e)
-        if "Jupiter 429 Too Many Requests" in msg:
-            print(f"[ENTRY/{mint}] Jupiter 429 на fast-quote, скипаю этот сигнал.")
-            return
-        print(f"[ENTRY/{mint}] Ошибка fast-quote (без тяжёлых фоллбеков): {e}")
-        return
+            wsol_in_lamports = int(BUY_WSOL * 1_000_000_000)
 
-    if quote is None:
-        print(f"[ENTRY/{mint}] Не удалось получить маршрут через Jupiter. Скип.")
-        return
+            with tlog("wsol_balance_ms", timings):
+                if WSOL_WS_BALANCE and WSOL_BALANCE_READY:
+                    cur_wsol = int(WSOL_BALANCE_LAMPORTS)
+                else:
+                    cur_wsol = await asyncio.to_thread(get_wsol_balance_fast, MY_PUBKEY)
 
-    out_raw = int(quote.get("outAmount", "0") or "0")
-    if out_raw <= 0:
-        print(f"[ENTRY/{mint}] outAmount=0, отменяю.")
-        return
+            if cur_wsol < wsol_in_lamports:
+                need = (wsol_in_lamports - cur_wsol) / 1_000_000_000
+                print(
+                    f"[ENTRY/{mint}] ❌ Недостаточно WSOL. Баланс={cur_wsol/1e9:.6f} WSOL, "
+                    f"нужно={BUY_WSOL:.6f} WSOL (не хватает {need:.6f} WSOL). Скип."
+                )
+                return
 
-    # === Правильный расчёт входной цены: SOL за 1 целый токен ===
-    dec = get_mint_decimals_cached(mint)
-    amount_tokens = out_raw / (10 ** dec)
-    if amount_tokens <= 0:
-        print(f"[ENTRY/{mint}] amount_tokens<=0, отменяю.")
-        return
+            print(
+                f"🔥 [TOKEN {mint}] Сигнал входа: продажа {sol_amt:.4f} SOL (share≈{sell_share_pct:.2f}%), "
+                f"покупаю на {BUY_WSOL} WSOL..."
+            )
 
-    sol_in = lamports_in / 1_000_000_000  # сколько SOL потратили
-    entry_price_wsol_per_token = sol_in / amount_tokens  # SOL за 1 токен
+            try:
+                with tlog("quote_ms", timings):
+                    quote = await asyncio.to_thread(jup_quote_for_entry, WSOL_MINT, mint, wsol_in_lamports, False, None)
+            except Exception as e:
+                msg = str(e)
+                if "429" in msg:
+                    print(f"[ENTRY/{mint}] Jupiter 429 на quote, скип.")
+                    return
+                print(f"[ENTRY/{mint}] Ошибка quote: {e}")
+                return
 
-    amm_key = None
-    label = None
-    rp = quote.get("routePlan") or []
-    if rp:
-        info = rp[0].get("swapInfo") or {}
-        amm_key = (info.get("ammKey") or "").strip()
-        label = info.get("label")
+            out_raw = int(quote.get("outAmount", "0") or "0")
+            if out_raw <= 0:
+                print(f"[ENTRY/{mint}] outAmount=0, отменяю.")
+                return
 
-    print(
-        f"[ENTRY/TOKEN {mint}] Входная цена ≈ {entry_price_wsol_per_token:.10f} WSOL/токен "
-        f"(~{amount_tokens:.4f} токенов, raw={out_raw})"
-    )
-    if label or amm_key:
-        print(f"✅ Маршрут через {label}, пул: {amm_key}")
+            with tlog("decimals_ms", timings):
+                dec = await asyncio.to_thread(get_mint_decimals_cached, mint)
 
-    try:
-        # Покупка: используем стандартную приору для BUY (PRIORITY_FEE_LAMPORTS)
-        b64_tx = jup_swap(quote, MY_PUBKEY)
-        sig = send_signed_sync(b64_tx)
-        print(f"[ENTRY/TOKEN {mint}] Покупка отправлена, сигнатура: {sig}")
-    except Exception as e:
-        print(f"[ENTRY/TOKEN {mint}] Ошибка отправки swap-транзакции: {e}")
-        return
+            amount_tokens = out_raw / (10 ** dec)
+            if amount_tokens <= 0:
+                print(f"[ENTRY/{mint}] amount_tokens<=0, отменяю.")
+                return
 
-    if AUTO_SELL:
-        state = EntryState(
-            mint=mint,
-            entry_price_wsol_per_token=entry_price_wsol_per_token,
-            amm_key=amm_key,
-            decimals=dec,
-        )
-        ACTIVE_ENTRIES[mint] = state
-        save_positions_from_active()
-        asyncio.create_task(autosell_worker(state))
+            wsol_in = wsol_in_lamports / 1_000_000_000
+            entry_price_wsol_per_token = wsol_in / amount_tokens
+
+            amm_key = None
+            label = None
+            rp = quote.get("routePlan") or []
+            if rp:
+                info = rp[0].get("swapInfo") or {}
+                amm_key = (info.get("ammKey") or "").strip()
+                label = info.get("label")
+
+            print(f"[ENTRY/{mint}] entry≈{entry_price_wsol_per_token:.10f} WSOL/токен (~{amount_tokens:.4f} токенов)")
+            if label or amm_key:
+                print(f"✅ Маршрут: {label}, пул: {amm_key}")
+
+            try:
+                with tlog("swap_build_ms", timings):
+                    b64_tx = await asyncio.to_thread(jup_swap, quote, MY_PUBKEY, PRIORITY_FEE_LAMPORTS)
+                with tlog("send_total_ms", timings):
+                    sig = await asyncio.to_thread(send_signed, b64_tx)
+            except Exception as e:
+                print(f"[ENTRY/{mint}] Ошибка отправки: {e}")
+                return
+
+            timings["TOTAL_ms"] = round((time.perf_counter() - t_total) * 1000, 2)
+            timings["ws_to_entry_ms"] = round((now_ms() - timings["ws_recv_ms"]), 2)
+
+            print(
+                f"[SPEED/{mint}] ws_to_entry={timings.get('ws_to_entry_ms')}ms "
+                f"wsol_balance={timings.get('wsol_balance_ms')}ms "
+                f"quote={timings.get('quote_ms')}ms swap_build={timings.get('swap_build_ms')}ms "
+                f"send_total={timings.get('send_total_ms')}ms TOTAL={timings.get('TOTAL_ms')}ms sig={sig}"
+            )
+
+            print(f"[ENTRY/{mint}] Покупка отправлена, sig: {sig}")
+
+            # ✅ фикс: не покупать повторно "пока не продали"
+            state = EntryState(
+                mint=mint,
+                entry_price_wsol_per_token=entry_price_wsol_per_token,
+                amm_key=amm_key,
+                decimals=dec,
+                active=True,
+            )
+            ACTIVE_ENTRIES[mint] = state
+            save_positions_from_active()
+
+            if AUTO_SELL:
+                asyncio.create_task(autosell_worker(state))
+            else:
+                print(f"[ENTRY/{mint}] AUTO_SELL выключен — позиция помечена активной (повторных покупок не будет).")
+
+        finally:
+            # pending снимаем всегда
+            async with PENDING_LOCK:
+                PENDING_ENTRIES.discard(mint)
 
 
 # ==========================
@@ -1190,84 +1492,33 @@ PUMP_WSS_URL = f"wss://pumpportal.fun/api/data?api-key={PUMP_API_KEY}"
 
 
 def _get_side_flags(msg: dict) -> Tuple[bool, bool]:
-    """
-    Возвращает (is_buy, is_sell) из сообщения pumpportal.
-
-    Приоритет:
-      1) булевое поле is_buy / isBuy (доверяем ему как основному источнику)
-      2) строковое поле side / tradeType / txType ('buy' / 'sell')
-      3) если непонятно — считаем, что ни buy, ни sell (False, False)
-    """
     is_buy_raw = msg.get("is_buy")
     if is_buy_raw is None:
         is_buy_raw = msg.get("isBuy")
 
-    # Если явно булевое значение — это самый надёжный источник.
     if isinstance(is_buy_raw, bool):
         return bool(is_buy_raw), (not bool(is_buy_raw))
 
-    # Фолбэк на строковый side / tradeType / txType
-    side_raw = (
-        str(
-            msg.get("side")
-            or msg.get("tradeType")
-            or msg.get("txType")
-            or ""
-        )
-    ).lower()
-
+    side_raw = str(msg.get("side") or msg.get("tradeType") or msg.get("txType") or "").lower()
     if side_raw == "buy":
         return True, False
     if side_raw == "sell":
         return False, True
 
-    # Ничего внятного — лучше вообще не считать это сигналом
-    print(
-        f"[DEBUG SIDE] Не удалось определить side: is_buy={msg.get('is_buy')}, "
-        f"isBuy={msg.get('isBuy')}, side={msg.get('side')}, "
-        f"tradeType={msg.get('tradeType')}, txType={msg.get('txType')}"
-    )
-    mint_dbg = (
-        msg.get("mint")
-        or msg.get("token")
-        or msg.get("tokenMint")
-        or msg.get("tokenAddress")
-    )
-    print(
-        f"[DEBUG RAW] msg for mint {mint_dbg}: "
-        f"keys={list(msg.keys())}, is_buy={msg.get('is_buy')}, isBuy={msg.get('isBuy')}, "
-        f"side={msg.get('side')}, tradeType={msg.get('tradeType')}, txType={msg.get('txType')}"
-    )
     return False, False
 
 
 async def handle_trade_msg(msg: dict, ws):
-    """
-    Обработка одного сообщения от pumpportal.
+    timings = {"ws_recv_ms": now_ms()}
+    t0 = time.perf_counter()
 
-    Логика:
-      1) следим за покупками отслеживаемых кошельков → добавляем mint в watch-лист;
-      2) по токенам из watch-листа:
-         - рассматриваем ТОЛЬКО ПРОДАЖИ (sell), определённые по полям is_buy/isBuy/side/txType;
-         - токен должен иметь ликвидность ≥ MIN_LIQ_USD,
-         - одна продажа должна быть не меньше MIN_SELL_SHARE_PCT % от SOL-части пула,
-         - без проверки drop_pct по цене (для экономии квотов Jupiter),
-         → входим в токен.
-    """
-    # control-сообщения типа {"message":"Successfully subscribed to keys."}
     if "mint" not in msg and "token" not in msg and "tokenMint" not in msg and "tokenAddress" not in msg:
         return
 
-    mint = (
-        msg.get("mint")
-        or msg.get("token")
-        or msg.get("tokenMint")
-        or msg.get("tokenAddress")
-    )
+    mint = msg.get("mint") or msg.get("token") or msg.get("tokenMint") or msg.get("tokenAddress")
     if not mint:
         return
 
-    # Ищем адрес трейдера во всех возможных полях pumpportal
     possible_trader_keys = [
         "wallet",
         "buyer",
@@ -1289,26 +1540,17 @@ async def handle_trade_msg(msg: dict, ws):
             trader = val
             break
 
-    # Фолбэк на старую схему, если вдруг ничего не нашли
     if trader is None:
-        trader = (
-            msg.get("wallet")
-            or msg.get("account")
-            or msg.get("owner")
-            or msg.get("trader")
-            or msg.get("user")
-        )
+        trader = msg.get("wallet") or msg.get("account") or msg.get("owner") or msg.get("trader") or msg.get("user")
 
     seller = trader or "UNKNOWN"
 
-    # 🧠 НОВОЕ: аккуратно определяем buy/sell
     is_buy, is_sell = _get_side_flags(msg)
     if not is_buy and not is_sell:
-        # Непонятный тип операции — пропускаем
         return
 
     sol_amt = 0.0
-    for k in ("sol_amount", "solAmount", "native", "nativeAmount", "solAmount"):
+    for k in ("sol_amount", "solAmount", "native", "nativeAmount"):
         if k in msg and msg[k] is not None:
             try:
                 sol_amt = float(msg[k])
@@ -1316,130 +1558,135 @@ async def handle_trade_msg(msg: dict, ws):
             except Exception:
                 continue
 
-    # 1) Покупка отслеживаемым кошельком -> добавить mint + подписаться на trades по этому mint
+    # --- wallet tracking (без блокировки)
     if trader in WATCH_WALLETS and is_buy and sol_amt >= MIN_WALLET_BUY_SOL:
-        print(
-            f"[WALLET-BUY] {trader} купил токен {mint} на {sol_amt:.4f} SOL "
-            f"(порог {MIN_WALLET_BUY_SOL})"
-        )
-        add_watched_mint(mint)
-        if mint not in SUBSCRIBED_TOKENS:
-            sub = {
-                "method": "subscribeTokenTrade",
-                "keys": [mint],
-            }
-            await ws.send(json.dumps(sub))
-            SUBSCRIBED_TOKENS.add(mint)
+        print(f"[WALLET-BUY] {trader} купил {mint} на {sol_amt:.4f} SOL")
+        asyncio.create_task(add_watched_mint_async(mint))
+        async with WATCH_LOCK:
+            need_sub = mint not in SUBSCRIBED_TOKENS
+            if need_sub:
+                SUBSCRIBED_TOKENS.add(mint)
+        if need_sub:
+            await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": [mint]}))
             print(f"[WS] subscribed to token: {mint}")
 
-    # 2) Нас интересуют сигналы только по токенам из WATCHED_MINTS
-    if mint not in WATCHED_MINTS:
+    async with WATCH_LOCK:
+        watched = mint in WATCHED_MINTS
+    if not watched:
         return
 
-    # 3) Нас интересуют ТОЛЬКО ПРОДАЖИ
     if not is_sell:
-        # Это покупка — для стратегии входа по продаже игнорируем
         return
-
     if sol_amt <= 0:
         return
 
-    # 4) Проверяем ликвидность — через кэш
-    cur_liq, sol_in_pool_est = get_liquidity_info_cached(mint)
+    # ✅ ТИХО: если уже есть позиция (или уже идёт вход) — игнорим без liq/логов
+    st = ACTIVE_ENTRIES.get(mint)
+    if st is not None and st.active:
+        return
+    async with PENDING_LOCK:
+        if mint in PENDING_ENTRIES:
+            return
+
+    # ---- LIQ check ----
+    with tlog("liq_ms", timings):
+        cur_liq, sol_in_pool_est, from_cache = await get_liquidity_cached_fast(mint)
+
+    # если Dexscreener отдал 429/ошибку и ликва не известна — не спамим "0.00"
+    if cur_liq <= 0:
+        return
+
     if cur_liq < MIN_LIQ_USD:
         print(
-            f"[TOKEN {mint}] Ликвидность слишком низкая (${cur_liq:.2f} < ${MIN_LIQ_USD:.2f}), "
-            f"не рассматриваю этот токен для входа."
+            f"[TOKEN {mint}] Ликвидность низкая (${cur_liq:.2f} < ${MIN_LIQ_USD:.2f}), скип. "
+            f"liq_ms={timings.get('liq_ms')}ms cache={from_cache}"
         )
         return
 
-    # 4.1 Оценка доли SOL-части пула, которая вышла за одну продажу
     sell_share_pct = 0.0
     if sol_in_pool_est > 0:
         sell_share_pct = 100.0 * sol_amt / sol_in_pool_est
 
-    if sol_in_pool_est <= 0:
+    if sol_in_pool_est > 0 and sell_share_pct < MIN_SELL_SHARE_PCT:
         print(
-            f"[TOKEN {mint}] Не удалось оценить SOL в пуле (liq=${cur_liq:.2f}), "
-            f"но ликвидность ок, смотрю только на размер продажи в SOL."
+            f"[TOKEN {mint}] Продажа мала: {sell_share_pct:.2f}% пула (< {MIN_SELL_SHARE_PCT}%), скип. "
+            f"liq_ms={timings.get('liq_ms')}ms cache={from_cache}"
         )
-    else:
-        if sell_share_pct < MIN_SELL_SHARE_PCT:
-            print(
-                f"[TOKEN {mint}] Продажа {sol_amt:.4f} SOL слишком мала: "
-                f"{sell_share_pct:.2f}% пула (< {MIN_SELL_SHARE_PCT}%). Скип."
-            )
+        return
+
+    timings["after_filters_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+    print(
+        f"[TOKEN {mint}] ПРОДАЖА на {sol_amt:.4f} SOL от {seller}. liq≈${cur_liq:.0f} share≈{sell_share_pct:.2f}% "
+        f"(after_filters={timings.get('after_filters_ms')}ms liq_ms={timings.get('liq_ms')}ms cache={from_cache})"
+    )
+
+    # ✅ anti-double-buy: помечаем pending уже тут (после фильтров)
+    async with PENDING_LOCK:
+        if mint in PENDING_ENTRIES:
             return
+        PENDING_ENTRIES.add(mint)
 
-    # 5) Больше НЕ проверяем падение цены через Jupiter (экономим квоты).
-    #    Просто используем старый кэш для красивого лога.
-    prev_price = TOKEN_PRICE_CACHE.get(mint)
-    cur_price = prev_price if prev_price is not None else 0.0
-    drop_pct = 0.0
-
-    print(
-        f"[TOKEN {mint}] ПРОДАЖА на {sol_amt:.4f} SOL от {seller}. "
-        f"liq=${cur_liq:.0f} share≈{sell_share_pct:.2f}%"
-    )
-
-    print(
-        f"🔥 [TOKEN {mint}] ОДНА продажа на {sol_amt:.4f} SOL вызвала падение цены {drop_pct:.2f}% "
-        f"и даёт ~{sell_share_pct:.2f}% SOL-части пула. Вхожу в токен по стратегии."
-    )
-
-    await enter_token_on_signal(
-        mint,
-        sol_amt=sol_amt,
-        sell_share_pct=sell_share_pct,
-        drop_pct=drop_pct,
+    asyncio.create_task(
+        enter_token_on_signal(
+            mint,
+            sol_amt=sol_amt,
+            sell_share_pct=sell_share_pct,
+            drop_pct=0.0,
+            ws_recv_ms_stamp=timings["ws_recv_ms"],
+        )
     )
 
 
 async def ws_loop():
     print(
         f"[WALLET-MODE] Следим за кошельками: {', '.join(WATCH_WALLETS)}\n"
-        f"Если они покупают токен ≥ {MIN_WALLET_BUY_SOL} SOL — добавляем mint в список.\n"
-        f"Если по токену из списка есть ПРОДАЖА (любая > 0 SOL), ликва ≥ {MIN_LIQ_USD}$, "
-        f"эта продажа даёт ≥ {MIN_SELL_SHARE_PCT}% SOL-части пула (по оценке) — входим (без проверки падения цены)."
+        f"Если они покупают токен ≥ {MIN_WALLET_BUY_SOL} SOL — добавляем mint.\n"
+        f"Если по токену из списка есть ПРОДАЖА, liq ≥ {MIN_LIQ_USD}$ и share ≥ {MIN_SELL_SHARE_PCT}% — входим.\n"
+        f"Покупка делается строго из WSOL баланса (wrap не используем).\n"
+        f"Jito tip: отдельной best-effort транзакцией перед swap (JITO_TIP_LAMPORTS={JITO_TIP_LAMPORTS})."
     )
 
-    # Прогрев ликвидности по токенам из файла (не обязательно, но красиво)
+    # прогрев ликвы
     if WATCHED_MINTS:
-        print(f"[DEX LIQ INIT] Прогрев ликвидности для {len(WATCHED_MINTS)} токенов...")
-        for m in WATCHED_MINTS:
-            liq, sol_est = get_liquidity_info_cached(m)
-            print(f"[DEX LIQ INIT] {m}: liq≈${liq:,.2f}, SOL_часть≈{sol_est:.4f} SOL")
+
+        async def warmup():
+            for m in list(WATCHED_MINTS):
+                try:
+                    res = await asyncio.to_thread(get_liquidity_info, m)
+                    if res is None:
+                        continue
+                    liq, sol_est = res
+                    async with LIQ_LOCK:
+                        LIQ_CACHE[m] = (liq, sol_est, time.time())
+                    print(f"[DEX LIQ INIT] {m}: liq≈${liq:,.2f}, SOL_часть≈{sol_est:.4f} SOL")
+                except Exception:
+                    pass
+
+        asyncio.create_task(warmup())
 
     while True:
         try:
             print(f"[WS] connecting → {PUMP_WSS_URL}")
             async with websockets.connect(PUMP_WSS_URL, ping_interval=20, ping_timeout=20) as ws:
-                sub_acc = {
-                    "method": "subscribeAccountTrade",
-                    "keys": WATCH_WALLETS,
-                }
-                await ws.send(json.dumps(sub_acc))
+                await ws.send(json.dumps({"method": "subscribeAccountTrade", "keys": WATCH_WALLETS}))
                 print(f"[WS] subscribed to account(s): {', '.join(WATCH_WALLETS)}")
 
-                if WATCHED_MINTS:
-                    sub_tok = {
-                        "method": "subscribeTokenTrade",
-                        "keys": WATCHED_MINTS,
-                    }
-                    await ws.send(json.dumps(sub_tok))
-                    print(f"[WS] subscribed to token(s): {', '.join(WATCHED_MINTS)}")
+                async with WATCH_LOCK:
+                    init_tokens = list(WATCHED_MINTS)
+                if init_tokens:
+                    await ws.send(json.dumps({"method": "subscribeTokenTrade", "keys": init_tokens}))
+                    print(f"[WS] subscribed to token(s): {', '.join(init_tokens)}")
 
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
                     except Exception:
                         continue
-
                     if isinstance(msg, dict) and "errors" in msg:
                         print("[WS ERROR MSG]", msg)
                         continue
-
                     await handle_trade_msg(msg, ws)
+
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -1452,8 +1699,33 @@ async def ws_loop():
 # ==========================
 
 async def main():
-    # Восстанавливаем позиции из файла и поднимаем autosell
+    global MAIN_LOOP, WSOL_ACCOUNT, WSOL_BALANCE_LAMPORTS, WSOL_BALANCE_READY
+    MAIN_LOOP = asyncio.get_running_loop()
+
+    # 1) найдём РЕАЛЬНЫЙ WSOL token-account (может быть НЕ ATA)
+    WSOL_ACCOUNT = await asyncio.to_thread(find_best_wsol_account, MY_PUBKEY)
+    print(f"[WSOL] best token account = {WSOL_ACCOUNT} (ATA={WSOL_ATA})")
+
+    # 2) выставим initial баланс сразу (чтобы не было 0 в первые миллисекунды)
+    try:
+        WSOL_BALANCE_LAMPORTS = int(get_wsol_balance_fast(MY_PUBKEY))
+        WSOL_BALANCE_READY = True
+        print(f"[WSOL] initial balance = {WSOL_BALANCE_LAMPORTS / 1e9:.9f} WSOL")
+    except Exception as e:
+        print(f"[WSOL] initial balance fetch failed: {e}")
+
+    # 3) WSOL баланс в фоне (0 RPC в hot-path, если включено)
+    if WSOL_WS_BALANCE:
+        asyncio.create_task(wsol_balance_ws_listener())
+
     restore_autosell_from_disk()
+
+    # ВАЖНО: refresher — основной источник 429 на Dexscreener.
+    # Если хочешь включить обратно — раскомментируй и поставь в .env:
+    # LIQ_REFRESH_SEC=60
+    # LIQ_REFRESH_CONCURRENCY=1
+    # asyncio.create_task(liquidity_refresher())
+
     await ws_loop()
 
 
